@@ -1,0 +1,963 @@
+#!/bin/bash
+
+isvalid () {
+	r=0
+	c=0
+	mac=$1
+	for i in $(echo $mac | tr ":" "\n"); do
+		case $i in
+		""|*[!0-9a-fA-F]*)
+			r=1
+			break
+			;;
+		??) 
+			;;
+		*)
+			r=1
+			break
+			;;
+		esac
+		c=$(( $c + 1 ))
+	done
+	if [ $r -eq 0 ]; then
+		[ $c -ne 6 ] && r=1
+	fi
+	return $r
+}
+
+hwr_permit_defaults () {
+	
+	[ -z "$HWR_PERMITS" ] && return 0
+	(
+	while IFS=';' read -ra device; do
+		for mac in "${device[@]}"; do
+			isvalid $mac
+			if [ $? -ne 0 ]; then
+				echo "error: invalid address $mac"
+				rm -f permit.exe
+				return 0
+			fi
+			# permit $mac
+			echo "INSERT INTO NoxStatus VALUES \
+			(\"${mac}\", \"permit\", \"user\") \
+			ON DUPLICATE KEY UPDATE \
+			state=VALUES(state), source=VALUES(source);"
+		done
+	done <<< "$HWR_PERMITS"
+	) > permit.exe
+	mysql -u homeuser -phomework -D Homework < permit.exe &>/dev/null
+	[ $? -ne 0 ] && echo "Failed to permit devices by default."
+	rm -f permit.exe
+	return 0
+}
+
+hwr_lock () {
+	trap "hwr_signal" 1 2 3 8 11 16 17
+	return 0
+}
+
+hwr_signal () {
+	echo "insert into Sys values (\"ESIG\")" > sysf
+}
+
+hwr_rotate () { # rotate a directory
+	
+	[ -d $1 ] && (
+	if [ "$(ls -A $1)" ]; then
+		# directory exists and is not empty
+		echo -n "rotating $1..."
+		s=`date +%Y%m%d%H%M%S`
+		mv $1 $1-$s
+		mkdir -p $1
+		sync
+		echo "OK"
+	fi
+	) || (
+	# create directory
+	mkdir -p $1
+	)
+	return 0
+}
+
+hwr_process_clear () {
+	name=$1
+	shift 1
+	# Check if $name.pid exists but process is not running
+	t=\""$@"\"
+	pgrep -lf "$t" &>/dev/null
+	if [ \( $? -eq 1 \) -a \( -f $PIDDIR/$name.pid \) ]; then
+		rm $PIDDIR/$name.pid
+	fi
+	return 0
+}
+
+hwr_process_check () {
+	
+	name=$1
+	# Check if process $name is running
+	[ -s $PIDDIR/$name.pid ] && (
+		$HWR_VERBOSE && echo "${name}.pid found"
+		pid=`cat $PIDDIR/$name.pid`
+		ps -p $pid &>/dev/null
+		return $?
+
+	) || ( # unlikely
+		shift 1
+		t=\""$@"\"
+		pgrep -lf "$t" &>/dev/null
+		[ $? -eq 1 ] && return 1 || (
+			echo "warning: $name is beyond our control"
+			return 0
+		)
+	)
+}
+
+hwr_daemon_start () {
+
+	name=$1
+	
+	hwr_process_clear "$@"
+	hwr_process_check "$@"
+	[ $? -eq 0 ] && return 1
+	
+	shift 1 # ignore process alias
+	(
+		if [ $name == "hwdbserver" ]; then
+			# redirect standard file descriptors to log files
+			[[ -t 0 ]] && exec 0</dev/null
+			if $HWR_OUT_LOG; then
+				[[ -t 1 ]] && exec 1>${HOME}/${name}.out
+			else
+				[[ -t 1 ]] && exec 1>/dev/null
+			fi
+			[[ -t 2 ]] && exec 2>${HOME}/${name}.err
+		else
+			# redirect standard file descriptors
+			[[ -t 0 ]] && exec 0</dev/null
+			[[ -t 1 ]] && exec 1>/dev/null
+			[[ -t 2 ]] && exec 2>/dev/null
+		fi
+		# close non-standard file descriptors
+		eval exec {3..255}\>\&-
+		trap '' 1 2 # ignore HUP INT in child process
+		if $HWR_WITH_VALGRIND; then
+			# select which application to debug with valgrind
+			if [ $name == "hwdbserver" ]; then
+				exec valgrind --log-file=$LOGDIR/$name.log \
+				--leak-check=full --show-reachable=yes "$@"
+			else
+				exec "$@"
+			fi
+		else
+			exec "$@"
+		fi
+	) &
+	pid=$!
+	disown -h $pid
+	$HWR_VERBOSE && echo "${name}'s pid ${pid}"
+	echo $pid > $PIDDIR/${name}.pid
+	return 0
+}
+
+hwr_process_stop () {
+	
+	[ -s $PIDDIR/$1.pid ] && (
+
+		pid=`cat $PIDDIR/$1.pid`
+		kill -15 $pid &>/dev/null
+		rm $PIDDIR/$1.pid
+		return 0
+	) || (
+	
+		echo "error: $PIDDIR/$1.pid not found"
+		return 1
+	)
+}
+
+hwr_wifi_set_master_mode () { # configure hostapd
+
+	rfkill unblock all
+	./hostapd.sh
+	# Restart to set the wireless interface into master mode.
+	/etc/init.d/hostapd start > /dev/null &>/dev/null
+	/etc/init.d/hostapd  stop > /dev/null &>/dev/null
+	return 0
+}
+
+hwr_wifi_add_monitor () { # creates $FISH interface
+	
+	iw dev $WLESS_IF interface add $FISH type monitor &>/dev/null
+	ifconfig $FISH up &>/dev/null
+	return $?
+}
+
+hwr_wifi_del_monitor () {
+	
+	ifconfig $FISH down &>/dev/null
+	iw dev $FISH del &>/dev/null
+	return $?
+}
+
+hwr_conf_bridge () {
+	
+	if $OVS_ENABLED; then
+
+	[ "$(lsmod | grep bridge)" ] && /sbin/rmmod bridge
+
+	insmod $OVS_DIR/datapath/linux/openvswitch_mod.ko
+	insmod $OVS_DIR/datapath/linux/brcompat_mod.ko
+	
+	[ -e ovsdb.conf ] && rm ovsdb.conf
+	ovsdb-tool create ovsdb.conf \
+	$OVS_DIR/vswitchd/vswitch.ovsschema
+
+	f="/var/run/ovsdb-server" # Listen on $f for a connection.
+	ovsdb-server ovsdb.conf --remote=punix:$f --detach \
+	--monitor \
+	--pidfile=$PIDDIR/ovsdb-server.pid
+	
+	ovs-vswitchd unix:$f --detach \
+	--monitor \
+	--pidfile=$PIDDIR/ovs-vswitchd.pid
+
+	ovs-vsctl --db=unix:$f init
+	ovs-vsctl --db=unix:$f add-br $BRIDGE
+	# Run standalone instead of secure
+	ovs-vsctl --db=unix:$f set-fail-mode  $BRIDGE standalone
+	ovs-vsctl --db=unix:$f set-controller $BRIDGE \
+		tcp:127.0.0.1:6633
+	ovs-vsctl --db=unix:$f add-port $BRIDGE $WLESS_IF
+	ovs-vsctl --db=unix:$f add-port $BRIDGE $WIRED_IF
+
+	ifconfig $BRIDGE $GATEWAY_ADDRESS up
+	# ifconfig $BRIDGE up
+
+	$NOX_ENABLED && (
+	t=`pwd`
+	cd $NOX_DIR/build/src/
+	if $NOX_LOG; then
+		./nox_core -v -i ptcp:localhost homework pyswitch monitoring flow_stats &>$HOME/nox.out &
+	else
+		./nox_core -p $PIDDIR/nox.pid -d -v -i ptcp:localhost homework pyswitch monitoring flow_stats &
+	fi
+	cd $t
+	)
+	
+	else # set linux bridge 
+	
+	brctl addbr $BRIDGE
+	brctl stp $BRIDGE off
+	ifconfig $BRIDGE $GATEWAY_ADDRESS up
+	brctl addif $BRIDGE $WIRED_IF
+	brctl addif $BRIDGE $WLESS_IF
+	route add default gw $GATEWAY_ADDRESS
+	
+	fi
+	
+	ifconfig $WIRED_IF down
+	ifconfig $WLESS_IF down
+	ifconfig $WIRED_IF "0.0.0.0" up
+	ifconfig $WLESS_IF "0.0.0.0" up
+	echo "1" > /proc/sys/net/ipv4/ip_forward
+	return 0
+}
+
+hwr_tear_bridge () {
+
+	if $OVS_ENABLED; then
+	
+	if $NOX_ENABLED; then
+		[ -e $PIDDIR/nox.pid ] && (
+		pid=`cat $PIDDIR/nox.pid`
+		kill $pid
+		rm $PIDDIR/nox.pid
+		)
+	fi
+	
+	f="/var/run/ovsdb-server" # Listens on $f for a connection.
+	ifconfig $BRIDGE down
+	ovs-vsctl --db=unix:$f del-port $BRIDGE $WLESS_IF
+	ovs-vsctl --db=unix:$f del-port $BRIDGE $WIRED_IF
+	ovs-vsctl --db=unix:$f del-br $BRIDGE
+	
+	[ -e $PIDDIR/ovs-vswitchd.pid ] && (
+		pid=`cat $PIDDIR/ovs-vswitchd.pid`
+		kill $pid
+		rm $PIDDIR/ovs-vswitchd.pid
+	)
+	
+	[ -e $PIDDIR/ovsdb-server.pid ] && (
+		pid=`cat $PIDDIR/ovsdb-server.pid`
+		kill $pid
+		rm $PIDDIR/ovsdb-server.pid
+	)
+
+	/sbin/rmmod $OVS_DIR/datapath/linux/brcompat_mod.ko
+	/sbin/rmmod $OVS_DIR/datapath/linux/openvswitch_mod.ko
+
+	else # tear down Linux bridge
+	
+	ifconfig $BRIDGE down
+	ifconfig $WIRED_IF down
+	ifconfig $WLESS_IF down
+	brctl delif $BRIDGE $WIRED_IF
+	brctl delif $BRIDGE $WLESS_IF
+	brctl delbr $BRIDGE
+	
+	fi
+	
+	# The following command disconnects the router from the Internet
+	# ifconfig $GATEWAY down
+
+	return 0
+}
+
+connected () { # Does $1 have an IP?
+	[ -z "$1" ] && return 1
+	s=`ifconfig $1 2>/dev/null | awk '$1 == "inet" { print $2 }'`
+	if [ -n "$s" ]; then
+		a=`echo $s | awk '{ split($0, t, ":"); print t[2] }'`
+		[ -n "$a" ] && return 0 # IP found
+	fi
+	return 1
+}
+
+hwr_connect () { # setup an Internet connection
+
+	case "$HWR_CONNECTION_TYPE" in
+	"cable" | "mpoa")
+	echo -n "connecting..."
+	dhclient $GATEWAY &>/dev/null
+	connected $GATEWAY
+	r=$?
+	[ $r -eq 0 ] && echo "OK" || echo "failed"
+	return $r
+	;;
+	"pppoe")
+	$HWR_DSL_MODEM_HAS_DHCP && (
+		dhclient $GATEWAY &>/dev/null
+		! connected $GATEWAY && echo "DSL modem is deyond our control"
+	)
+	echo -n "calling..."
+	./dsl.sh
+	pon dsl-provider >/dev/null 2>&1
+	sleep 5 # wait for pppd log
+	connected $PPPOE
+	r=$?
+	[ $r -eq 0 ] && echo "OK" || echo "failed"
+	$HWR_VERBOSE && plog
+	return $r
+	;;
+	*)
+	echo "error: unknown connection type"
+	exit 1
+	;;
+	esac
+	return 0
+}
+
+hwr_start_fail_safe () {
+
+	echo "30" > /proc/sys/kernel/panic
+	echo "10" > /proc/sys/kernel/panic_on_oops # delay
+	
+	# Module klogger_mod exports symbol
+	t=`pwd`
+	cd $HWDB_DIR/kernel/
+	./klog start $OVS_DIR/datapath/linux
+	cd $t
+
+	hwr_wifi_set_master_mode # Configures hostapd
+	
+	NOX_ENABLED=false # Disable nox control while building bridge.
+	hwr_conf_bridge
+	
+	hwr_connect
+	
+	./cfgFirewallNat &>/dev/null # Dimos's firewall.
+	
+	./dnsmasq.sh fail-safe # DNSMASQ should become act as a DHCP server as well.
+
+	/etc/init.d/dnsmasq start &>/dev/null
+	
+	/etc/init.d/hostapd start &>/dev/null
+	
+	return 0
+
+}
+
+hwr_start () {
+	
+	# These will prove quite useful now...
+	echo "30" > /proc/sys/kernel/panic
+	echo "10" > /proc/sys/kernel/panic_on_oops # delay
+	
+	# Module klogger_mod exports symbol
+	t=`pwd`
+	cd $HWDB_DIR/kernel/
+	./klog start $OVS_DIR/datapath/linux
+	cd $t
+
+	hwr_wifi_set_master_mode
+	hwr_wifi_add_monitor
+	# $WLESS_IF in master mode; $FISH in monitor mode
+	
+	hwr_conf_bridge
+	
+	hwr_connect
+	
+	./cfgFirewallNat &>/dev/null # Dimos's firewall.
+
+	hwr_daemon_start "linkpersist" \
+	$HWDB_DIR/persist -d $HWDB_DATA_DIR -t Links
+	
+	hwr_daemon_start "linklogger" \
+	$HWDB_DIR/linklogger -d $FISH
+
+	hwr_daemon_start "kflowpersist" \
+	$HWDB_DIR/persist -d $HWDB_DATA_DIR -t KFlows
+
+	hwr_daemon_start "kflowlogger" \
+	$HWDB_DIR/kflowlogger -d /dev/hwdb0 -t KFlows
+
+	hwr_daemon_start "nflowpersist" \
+	$HWDB_DIR/persist -d $HWDB_DATA_DIR -t NFlows
+	
+	hwr_daemon_start "nflowlogger" \
+	$HWDB_DIR/kflowlogger -d /dev/hwdb1 -t NFlows
+
+	hwr_daemon_start "httppersist" \
+	$HWDB_DIR/persist -d $HWDB_DATA_DIR -t Urls
+
+	hwr_daemon_start "khttplogger" $HWDB_DIR/khttplogger
+
+	hwr_daemon_start "dhcppersist" \
+	$HWDB_DIR/persistevent -d $HWDB_DATA_DIR -e LeasesLast -t Leases -a mysql &
+
+	hwr_daemon_start "syspersist" \
+	$HWDB_DIR/persistevent -d $HWDB_DATA_DIR -e SysLast -t Sys
+
+	hwr_daemon_start "usereventpersist" \
+	$HWDB_DIR/persist -d $HWDB_DATA_DIR -t UserEvents
+	
+	hwr_daemon_start "notifyrequestpersist" \
+	$HWDB_DIR/persist -d $HWDB_DATA_DIR -t NotificationRequest
+	
+	hwr_daemon_start "notifyresponsepersist" \
+	$HWDB_DIR/persist -d $HWDB_DATA_DIR -t NotificationResponse
+	
+	hwr_daemon_start "bwstatspersist" \
+	$HWDB_DIR/persist -d $HWDB_DATA_DIR -t BWStats
+	
+	hwr_daemon_start "noxstatuspersist" \
+	$HWDB_DIR/persistevent -d $HWDB_DATA_DIR -e NoxStatusLast -t NoxStatus -a mysql
+	
+	hwr_daemon_start "policystatepersist" \
+	$HWDB_DIR/persistevent -d $HWDB_DATA_DIR -e PolicyStateLast -t PolicyState -a mysql
+
+	hwr_daemon_start "policyfiredpersist" \
+	$HWDB_DIR/persistevent -d $HWDB_DATA_DIR -e PolicyFiredLast -t PolicyFired -a mysql
+	
+	hwr_daemon_start "policyrolloverpersist" \
+	$HWDB_DIR/persistevent -d $HWDB_DATA_DIR -e PolicyRolloverLast -t PolicyRollover -a mysql
+	
+	hwr_daemon_start "allowancespersist" \
+	$HWDB_DIR/persistevent -d $HWDB_DATA_DIR -e AllowancesLast -t Allowances -a mysql
+	
+	hwr_daemon_start "devicetypespersist" \
+	$HWDB_DIR/persistevent -d $HWDB_DATA_DIR -e DeviceTypesLast -t DeviceTypes -a mysql
+	
+	hwr_daemon_start "devicenamespersist" \
+	$HWDB_DIR/persistevent -d $HWDB_DATA_DIR -e DeviceNamesLast -t DeviceNames -a mysql
+	
+	hwr_daemon_start "userspersist" \
+	$HWDB_DIR/persistevent -d $HWDB_DATA_DIR -e UsersLast -t Users -a mysql
+	
+	hwr_daemon_start "bwusagepersist" \
+	$HWDB_DIR/persist -d $HWDB_DATA_DIR -t BWUsage -u 5 -a mysql
+	
+	hwr_daemon_start "policyrequestpersist" \
+	$HWDB_DIR/persist -d $HWDB_DATA_DIR -t PolicyRequest
+	
+	hwr_daemon_start "policyresponsepersist" \
+	$HWDB_DIR/persist -d $HWDB_DATA_DIR -t PolicyResponse
+	
+	hwr_daemon_start "noxcommandpersist" \
+	$HWDB_DIR/persist -d $HWDB_DATA_DIR -t NoxCommand
+	
+	hwr_daemon_start "noxresponsepersist" \
+	$HWDB_DIR/persist -d $HWDB_DATA_DIR -t NoxResponse
+	
+	# Start the notification service
+	(
+	nd=`pwd`
+	cd $HWNS_DIR/notifications
+	MY_CLASSPATH=".:${JAVA_LIBS}/gson-1.7.1.jar:${JAVA_LIBS}/jsrpc.jar:/usr/share/java/mysql.jar"
+	hwr_daemon_start "notifications" java -classpath $MY_CLASSPATH Main
+	cd $nd
+	)
+	# Start the policy engine
+	(
+	pd=`pwd`
+	cd $HWPE_DIR
+	hwr_daemon_start "pe" ant PolicyEngine
+	cd $pd
+	)
+	
+	#
+	# Backwards compatibility
+	# 
+	hwr_daemon_start "flowpersist" \
+	$HWDB_DIR/persist -d $HWDB_DATA_DIR -t Flows
+	
+	hwr_daemon_start "flowlogger" \
+	$HWDB_DIR/flowlogger -d $BRIDGE
+	
+	#
+	# Start packet capsuring code; rotate files every hour
+	#
+	if $MON_ENABLED; then
+		# tcpdump stdout/stderr are redirected to tcpdump.log file
+		echo "Boot at `date +%Y/%m/%d:%H:%M:%S`" >> tcpdump.log
+		tcpdump -n -i $BRIDGE -G 3600 -w "$MON_DIR/p-%Y.%m.%d-%H.%M.%S.trace" -z ./rotate.sh &>>tcpdump.log &
+		t=$!
+		disown -h $t
+		$HWR_VERBOSE && echo "tcpdump's pid ${t}"
+		echo $t > $PIDDIR/tcpdump.pid
+	fi
+	
+	#
+	# Start system
+
+	./dnsmasq.sh
+	/etc/init.d/dnsmasq start &>/dev/null
+	
+	/etc/init.d/tomcat6 start &>/dev/null
+	
+	/etc/init.d/hostapd start &>/dev/null
+	
+	echo "insert into Sys values (\"OK\")" > sysf
+	
+	return 0
+}
+
+hwr_stop () {
+	
+	/etc/init.d/hostapd stop &>/dev/null
+
+	/etc/init.d/tomcat6 stop &>/dev/null
+
+	/etc/init.d/dnsmasq stop &>/dev/null
+	
+	hwr_process_stop "notifications"
+
+	hwr_process_stop "pe"
+	
+	# Not used by anybody.
+	# hwr_process_stop "persistserver"
+
+	hwr_process_stop "linklogger"
+
+	hwr_process_stop "linkpersist"
+
+	hwr_process_stop "kflowlogger"
+
+	hwr_process_stop "kflowpersist"
+	
+	hwr_process_stop "nflowlogger"
+
+	hwr_process_stop "nflowpersist"
+
+	hwr_process_stop "khttplogger"
+
+	hwr_process_stop "httppersist"
+	
+	hwr_process_stop "usereventpersist"
+	
+	hwr_process_stop "notifyrequestpersist"
+	
+	hwr_process_stop "notifyresponsepersist"
+	
+	hwr_process_stop "bwstatspersist"
+
+	hwr_process_stop "dhcppersist"
+
+	hwr_process_stop "syspersist"
+
+	hwr_process_stop "flowlogger"
+
+	hwr_process_stop "flowpersist"
+	
+	hwr_process_stop "noxstatuspersist"
+	
+	hwr_process_stop "policyfiredpersist"
+
+	hwr_process_stop "policystatepersist"
+	
+	hwr_process_stop "policyrolloverpersist"
+	
+	hwr_process_stop "allowancespersist"
+	
+	hwr_process_stop "devicetypespersist"
+	
+	hwr_process_stop "devicenamespersist"
+	
+	hwr_process_stop "userspersist"
+	
+	hwr_process_stop "bwusagepersist"
+	
+	hwr_process_stop "policyrequestpersist"
+	
+	hwr_process_stop "policyresponsepersist"
+	
+	hwr_process_stop "noxcommandpersist"
+
+	hwr_process_stop "noxresponsepersist"
+
+	#
+	# Stop packet capsuring code
+	#
+	if $MON_ENABLED; then
+		hwr_process_stop "tcpdump"
+	fi
+
+	./cfgFirewallNat reset &>/dev/null
+	
+	hwr_tear_bridge
+	
+	hwr_wifi_del_monitor
+
+	$HWDB_DIR/kernel/klog stop
+	
+	hwr_process_stop "acpilogger"
+	[ -e acpf ] && rm -f acpf
+
+	hwr_process_stop "syslogger"
+	[ -e sysf ] && rm -f sysf
+	[ -e logf ] && rm -f logf
+
+	hwr_process_stop "hwdbserver"
+	$HWR_WITH_VALGRIND && echo "wait 10sec" && sleep 10
+	
+	# Finally, unregister cronjob.
+	crontab -r &>/dev/null
+	
+	return 0
+}
+
+hwr_print_jobs () {
+	
+	a=(`jobs -p -r`)
+	l=${#a[*]}
+	i=0
+	echo "[jobs attached]"
+	while [ $i -lt $l ]; do
+		files=`ls $PIDDIR/*.pid`
+		name="unknown"
+		for f in $files; do
+		pid=`cat $f`
+		if [ "${a[$i]}" = "$pid" ]; then 
+			t=${f%.*}
+			name=${t##*/}
+			break
+		fi
+		done
+		echo -e "${a[$i]}\t$name"
+		let i++
+	done
+	return 0
+}
+
+hwr_print_pids () {
+	error=0
+	for f in $(ls $PIDDIR/*.pid); do
+	p=`cat $f`
+	t=${f%.*}
+	n=${t##*/}
+	ps -p $p &>/dev/null
+	if [ $? -eq 0 ]; then
+		s="[+]"
+	else
+		s="[-]"
+		let error++
+		echo "`date +%Y/%m/%d:%H:%M:%S` $n" >> sysmngr.err
+	fi
+	$HWR_VERBOSE && echo -e "$p\t$s\t$n"
+	done
+	# Now, repeat check for the following daemons.
+	for dae in hostapd dnsmasq tomcat6 mysql; do
+	service ${dae} status &>/dev/null
+	if [ $? -eq 0 ]; then
+		s="[+]"
+	else
+		s="[-]"
+		let error++
+	fi
+	$HWR_VERBOSE && echo -e "\t$s\t$dae"
+	done
+	return ${error}
+}
+
+hwr_monitor_pids () {
+	(
+	while [ ! -e ".STOP" ]; do
+		clear
+		hwr_print_pids
+		if [ $? -eq 0 ]; then
+			echo "OK"
+		else
+			echo "Error $?"
+			hwr_shutdown "restart"
+			break
+		fi
+		sleep 60
+	done
+	) &
+	disown -h $!
+	$HWR_VERBOSE && echo "start monitoring..."
+}
+
+hwr_signal () {
+	echo "insert into Sys values (\"ESIG\")" > sysf
+}
+
+hwr_shutdown () {
+	#
+	# All relies upon the sysmonitor now...
+	#
+	echo $1 > .STOP
+	sm=`pidof -s sysmonitor`
+	kill -15 ${sm}
+}
+
+#
+# main
+#
+
+user=`id -u`
+if [ $user != "0" ]; then
+	echo "error: this script must be run as root" 1>&2
+	exit 1
+fi
+
+# Check if battery is discharging.
+acpi | grep "Discharging" &>/dev/null
+if [ $? -eq 0 ]; then
+	echo "error: battery is discharging" 1>&2
+	exit 1
+fi
+
+HWR_CONFIG_FILE="homework.conf"
+[ -r "$HWR_CONFIG_FILE" ] && . $HWR_CONFIG_FILE
+
+# Disable screen-saver
+setterm -powersave off -blank 0
+
+rm -f ".STOP"
+# Rotate files
+echo "Boot at `date +%Y/%m/%d:%H:%M:%S`" >> sysmngr.err
+# rm -f "sysmngr.err"
+
+# Set system usage monitor as a cronjob
+#
+rm -f ".NOTIFY" # Re-enable notifications, if previously disabled.
+crontab -r &>/dev/null
+[ -e "sys.cron" ] && crontab sys.cron
+crontab -l &>/dev/null
+[ $? -eq 1 ] && echo "warning: sys.cron is not running"
+
+suffix=`date +%Y%m%d%H%M%S`
+[ -s hwdbserver.err ] && mv hwdbserver.err $HWDB_DIR/hwdbserver.err.$suffix
+
+clear
+#
+# Start fail-safe mode?
+#
+c=9
+F=1
+while [ $c -ne 0 ]; do
+echo -n -e "\rPress any key within $c seconds to enter fail-safe mode."
+read -n 1 -s -t 1
+key=$?
+if [ $key -eq 0 ]; then
+	F=0 # start fail-safe
+	break
+fi
+let c--
+done
+echo "" # start a new line.
+if [ $F -eq 0 ]; then
+	hwr_start_fail_safe
+	if [ $? -eq 0 ]; then
+		clear
+		echo "OK"
+		read -p "Press <ENTER> to restart."
+		/sbin/shutdown -r now
+	else
+		echo "Fatal error."
+		/sbin/shutdown -h now
+	fi
+	exit 0
+fi
+
+[ -d "$PIDDIR" ] || mkdir -p $PIDDIR
+rm -f $PIDDIR/*.pid
+
+[ -d "$LOGDIR" ] || mkdir -p $LOGDIR
+rm -f $LOGDIR/*.log
+
+# rotate data directory
+hwr_rotate $HWDB_DATA_DIR
+
+# tcpdump ready.
+if $MON_ENABLED; then
+	[ -d "$MON_DIR" ] || mkdir -p $MON_DIR
+	# Configure
+	aa-complain /usr/sbin/tcpdump &>/dev/null
+	if [ $? -ne 0 ]; then
+		echo "warning: failed to configure tcpdump"
+		MON_ENABLED=false
+	fi
+fi
+
+# MySQL starts by default. If it is to start manually,
+# do it here.
+# mysql -u root -p < MySQL.spec
+
+# Not used by anybody.
+# hwr_daemon_start "persistserver" \
+# $HWDB_DIR/persistserver -c $HWDB_DIR/pdb.rc -d $HWDB_DATA_DIR
+
+HWDB_LOG_PACKETS=""
+$HWR_OUT_LOG && HWDB_LOG_PACKETS="-l packets"
+
+hwr_daemon_start "hwdbserver" \
+$HWDB_DIR/hwdbserver -c $HWDB_DIR/hwdb.rc $HWDB_LOG_PACKETS &
+$HWR_WITH_VALGRIND && echo "wait 10sec" && sleep 10
+
+#
+# Make sure that the iPad, iPod and other control interfaces
+# are always permitted.
+#
+# TODO: This should be commented out once the policy engine 
+# comes into play.
+#
+hwr_permit_defaults
+#
+# Reinstate rows from MySQL to HWDB.
+$HWDB_DIR/reinstate \
+-t Leases \
+-t NoxStatus \
+-t Allowances \
+-t DeviceNames \
+-t DeviceTypes \
+-t Users \
+-t PolicyState \
+-t PolicyFired \
+-t PolicyRollover \
+-t BWUsage
+
+#
+# Log <MSG> to table sys as follows:
+#
+# echo "insert into Sys values (\"<MSG>\")" > sysf
+#
+[ -e sysf ] && rm -f sysf
+[ -e logf ] && rm -f logf
+mkfifo sysf logf
+tail -f sysf > logf &
+echo "$!" > $PIDDIR/syslogger.pid
+$HWDB_DIR/hwdbclient -f logf &>/dev/null &
+
+if [ -x acpilogger ]; then
+[ -e acpf ] && rm -f acpf
+mkfifo acpf
+acpi_listen > acpf &
+echo "$!" > $PIDDIR/acpilogger.pid
+./acpilogger 1>/dev/null &
+else
+echo "warning: acpilogger not found"
+fi
+
+stty susp ^-
+stty intr ^-
+
+$HWDB_DIR/sysmonitor 2>&1 | while read line; do
+	$HWR_VERBOSE && echo $line
+	t=`echo "$line" | awk '{print $1}'`
+	m=`echo "$line" | awk '{print $2}'`
+	case "$m" in
+	"5<|>Subscribe_failed<|>0<|>0<|>") # sysmonitor failure
+	echo "error: $line"
+	break
+	;;
+	"0<|>Success<|>0<|>0<|>")
+	if [ "$t" = "subscribe" ]; then
+		hwr_lock
+		hwr_start
+	else
+		break
+	fi
+	;;
+	"OK")
+	clear
+	# hwr_print_pids
+	# error=$?
+	hwr_monitor_pids
+	# [ $error -eq 0 ] && echo "OK" || echo "Error $error"
+	;;
+	"EAC")
+	$HWR_VERBOSE && sleep 1 && acpi # print battery status
+	hwr_shutdown "shutdown"
+	;;
+	"EBTN")
+	$HWR_VERBOSE && echo "button pressed"
+	hwr_shutdown "restart"
+	;;
+	"USB")
+	# $HWR_VERBOSE && echo "usb inserted"
+	;;
+	"ERF")
+	$HWR_VERBOSE && echo "radio killed"
+	hwr_shutdown "restart"
+	;;
+	"ESIG")
+	$HWR_VERBOSE && echo "signal received"
+	hwr_shutdown "restart"
+	;;
+	*)
+	$HWR_VERBOSE && echo "unknown message: ${line}"
+	;;
+	esac
+done
+
+#
+# This code executes on exit
+#
+for i in 5 4 3 2 1; do
+	echo -n -e "\rThe router will stop working in $i"
+	sleep 1
+done
+echo -e "\nBye."
+
+HWR_REBOOT="unknown"
+[ -e .STOP ] && HWR_REBOOT=`cat .STOP`
+
+hwr_stop 2>/dev/null
+
+case "$HWR_REBOOT" in
+"restart")
+# echo "Restart."
+/sbin/shutdown -r now
+;;
+"shutdown")
+# echo "Shutdown."
+/sbin/shutdown -h now
+;;
+*)
+echo "Something is wrong. Press the power button continuously."
+;;
+esac
+
+exit 0
+
