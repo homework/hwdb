@@ -1,0 +1,53 @@
+{
+    "components": [
+        {
+            "name": "monitor" ,
+            "dependencies": [
+                "python"
+            ],
+            "python": "nox.coreapps.examples.monitor" 
+        },
+	{
+	    "name": "flow_stats" ,
+	    "dependencies": [
+		"python"
+	    ],
+	    "python": "nox.coreapps.examples.flow_stats"
+	},
+        {
+            "name": "countdown" ,
+            "dependencies": [
+                "python"
+            ],
+            "python": "nox.coreapps.examples.countdown" 
+        },
+        {
+            "name": "packetdump" ,
+            "dependencies": [
+                "python"
+            ],
+            "python": "nox.coreapps.examples.packetdump" 
+        },
+        {
+            "name": "pyloop" ,
+            "dependencies": [
+                "python"
+            ],
+            "python": "nox.coreapps.examples.pyloop" 
+        },
+        {
+            "name": "pyswitch" ,
+            "dependencies": [
+                "python"
+            ],
+            "python": "nox.coreapps.examples.pyswitch" 
+        },
+        {
+            "name": "dnsspy" ,
+            "dependencies": [
+                "python"
+            ],
+            "python": "nox.coreapps.examples.dnsspy" 
+        }
+    ]
+}

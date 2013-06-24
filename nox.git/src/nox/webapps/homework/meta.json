@@ -1,0 +1,14 @@
+{
+    "components": [
+    {
+        "name": "homework",
+            "dependencies": [
+            "pyhwdb",
+                "hwdbcontroller",
+            "pydhcp",
+            "webservice"
+                ],
+            "python": "nox.webapps.homework.homework"
+    }
+    ]
+}
